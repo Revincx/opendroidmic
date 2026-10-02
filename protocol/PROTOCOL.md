@@ -2,10 +2,16 @@
 
 ## Overview
 
-OpenDroidMic uses a compact binary protocol over UDP to stream audio from
-an Android device to a Linux PC. The protocol is designed for low-latency
-local network communication with built-in keepalive, reconnection, and
-packet loss detection.
+OpenDroidMic supports two independent UDP transports:
+
+1. **ODMC/1** — the compact protocol documented below, with handshake,
+   keepalive, reconnection, and the custom Linux receiver.
+2. **RTP/Opus** — RTP v2 with an RFC 7587 Opus payload, intended for direct
+   reception by PipeWire's `libpipewire-module-rtp-source`.
+
+RTP packets are not wrapped in an ODMC header and are not an ODMC packet type.
+
+## ODMC/1 Transport
 
 ## Packet Structure
 
@@ -127,7 +133,8 @@ Payload:
 | Channels       | 1 (mono)           |
 | Codec          | Opus               |
 | Frame Duration | 20 ms (960 samples)|
-| Bitrate        | 32 kbps            |
+| Bitrate        | 16–128 kbps, dynamically selectable |
+| Opus Bandwidth | Auto, Wideband, or Fullband |
 | Transport      | UDP                |
 | Max Packet     | 1500 bytes         |
 
@@ -221,3 +228,64 @@ Android app can scan to auto-fill the address.
 - The receiver only accepts packets from the connected client address.
 - The receiver should not be exposed to the internet.
 - Consider adding encryption (DTLS/Noise) for future versions.
+
+## RTP/Opus Transport
+
+RTP/Opus mode sends one complete 20 ms Opus packet in each RTP packet:
+
+```
+[12-byte RTP v2 header][Opus packet]
+```
+
+There is no ODMC `HELLO`, `PING`, `PONG`, `STOP`, or reconnect state in this
+mode. UDP does not provide receiver acknowledgement, so the Android UI reports
+where it is streaming rather than claiming that a receiver is connected.
+
+### RTP Header
+
+| Field | Value |
+|---|---|
+| Version | 2 |
+| Padding / Extension / CSRC | 0 |
+| Marker | 0 |
+| Payload Type | 127 by default (dynamic range) |
+| Sequence | Random 16-bit start, incremented once per packet |
+| Timestamp | Random 32-bit start, incremented by 960 per packet |
+| SSRC | Random 32-bit value per stream |
+| Byte order | Network byte order (big endian) |
+
+The Opus RTP clock is always 48 kHz. A 20 ms packet therefore advances the
+timestamp by `48000 * 0.020 = 960`, including when Opus internally selects a
+narrower audio bandwidth. Sequence numbers and timestamps wrap naturally.
+
+### RTP Audio Parameters
+
+| Parameter | Value |
+|---|---|
+| Input | 48 kHz, mono, PCM16 |
+| Opus application | VOIP |
+| Frame duration | 20 ms / 960 samples |
+| Bitrate | 16, 24, 32, 48, 64, 96, or 128 kbps |
+| Bandwidth | Auto, Wideband (8 kHz), or Fullband (20 kHz) |
+| Default UDP port | 38472 |
+
+Bitrate and bandwidth can change between Opus packets. No RTP signaling or
+receiver reconfiguration is required.
+
+### PipeWire Receiver
+
+Install `linux/pipewire/opendroidmic-rtp.conf` as:
+
+```bash
+mkdir -p ~/.config/pipewire/pipewire.conf.d
+cp linux/pipewire/opendroidmic-rtp.conf \
+  ~/.config/pipewire/pipewire.conf.d/90-opendroidmic-rtp.conf
+systemctl --user restart pipewire pipewire-pulse
+```
+
+The supplied configuration listens on UDP 38472, decodes Opus, and exposes
+`OpenDroidMic RTP` as an `Audio/Source`. It uses `sess.ignore-ssrc = true` so a
+new phone stream can use a newly randomized SSRC without reloading PipeWire.
+
+RTP mode has no authentication or encryption. Use it only on a trusted LAN and
+do not expose UDP 38472 to the public internet.

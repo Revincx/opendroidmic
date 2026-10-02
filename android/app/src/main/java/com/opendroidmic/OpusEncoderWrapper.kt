@@ -9,20 +9,33 @@ import io.github.jaredmdobson.concentus.OpusBandwidth
 class OpusEncoderWrapper(
     private val sampleRate: Int,
     private val channels: Int,
-    private val bitrate: Int
+    initialSettings: OpusSettings
 ) {
     private var encoder: OpusEncoder? = null
-    private val frameSize: Int = 960
+    private var appliedSettings: OpusSettings? = null
 
     init {
         try {
             encoder = OpusEncoder(sampleRate, channels, OpusApplication.OPUS_APPLICATION_VOIP).apply {
-                setBitrate(bitrate)
-                setBandwidth(OpusBandwidth.OPUS_BANDWIDTH_WIDEBAND)
+                applySettings(this, initialSettings)
             }
-            Log.d("OpusEncoder", "Initialized: ${sampleRate}Hz ${channels}ch ${bitrate}bps")
+            appliedSettings = initialSettings
+            Log.d("OpusEncoder", "Initialized: ${sampleRate}Hz ${channels}ch $initialSettings")
         } catch (e: OpusException) {
             Log.e("OpusEncoder", "Failed to init", e)
+        }
+    }
+
+    /** Must be called from the encoding thread, immediately before encode(). */
+    fun updateSettings(settings: OpusSettings) {
+        if (settings == appliedSettings) return
+        val enc = encoder ?: return
+        try {
+            applySettings(enc, settings)
+            appliedSettings = settings
+            Log.d("OpusEncoder", "Settings updated: $settings")
+        } catch (e: OpusException) {
+            Log.e("OpusEncoder", "Failed to update settings", e)
         }
     }
 
@@ -46,5 +59,16 @@ class OpusEncoderWrapper(
     fun release() {
         encoder?.resetState()
         encoder = null
+    }
+
+    private fun applySettings(encoder: OpusEncoder, settings: OpusSettings) {
+        encoder.setBitrate(settings.bitrate)
+        encoder.setBandwidth(
+            when (settings.bandwidth) {
+                OpusBandwidthMode.AUTO -> OpusBandwidth.OPUS_BANDWIDTH_AUTO
+                OpusBandwidthMode.WIDEBAND -> OpusBandwidth.OPUS_BANDWIDTH_WIDEBAND
+                OpusBandwidthMode.FULLBAND -> OpusBandwidth.OPUS_BANDWIDTH_FULLBAND
+            }
+        )
     }
 }

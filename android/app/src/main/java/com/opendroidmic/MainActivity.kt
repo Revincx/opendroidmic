@@ -12,6 +12,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.view.View
+import android.widget.ArrayAdapter
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
@@ -29,7 +30,12 @@ class MainActivity : AppCompatActivity() {
         private const val UI_UPDATE_INTERVAL = 100L
         private const val PREFS_NAME = "opendroidmic"
         private const val KEY_HOST = "last_host"
-        private const val KEY_PORT = "last_port"
+        private const val KEY_LEGACY_PORT = "last_port"
+        private const val KEY_ODMC_PORT = "odmc_port"
+        private const val KEY_RTP_PORT = "rtp_port"
+        private const val KEY_TRANSPORT = "transport"
+        private const val KEY_BITRATE = "opus_bitrate"
+        private const val KEY_BANDWIDTH = "opus_bandwidth"
     }
 
     private lateinit var editHost: com.google.android.material.textfield.TextInputEditText
@@ -44,6 +50,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnDiscover: MaterialButton
     private lateinit var btnScanQr: MaterialButton
     private lateinit var textDiscovery: TextView
+    private lateinit var dropdownTransport: com.google.android.material.textfield.MaterialAutoCompleteTextView
+    private lateinit var dropdownBandwidth: com.google.android.material.textfield.MaterialAutoCompleteTextView
+    private lateinit var dropdownBitrate: com.google.android.material.textfield.MaterialAutoCompleteTextView
 
     private var service: AudioStreamService? = null
     private var bound = false
@@ -51,6 +60,7 @@ class MainActivity : AppCompatActivity() {
     private var discoveryManager: DiscoveryManager? = null
     private var discovering = false
     private var pendingAction: (() -> Unit)? = null
+    private var selectedTransport = TransportMode.ODMC
 
     private val qrScanLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -154,18 +164,23 @@ class MainActivity : AppCompatActivity() {
         btnDiscover = findViewById(R.id.btnDiscover)
         btnScanQr = findViewById(R.id.btnScanQr)
         textDiscovery = findViewById(R.id.textDiscovery)
+        dropdownTransport = findViewById(R.id.dropdownTransport)
+        dropdownBandwidth = findViewById(R.id.dropdownBandwidth)
+        dropdownBitrate = findViewById(R.id.dropdownBitrate)
 
         discoveryManager = DiscoveryManager(this)
 
         val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
         val savedHost = prefs.getString(KEY_HOST, "")
-        val savedPort = prefs.getInt(KEY_PORT, 0)
+        selectedTransport = runCatching {
+            TransportMode.valueOf(prefs.getString(KEY_TRANSPORT, TransportMode.ODMC.name)!!)
+        }.getOrDefault(TransportMode.ODMC)
+        val savedPort = savedPortFor(selectedTransport)
         if (!savedHost.isNullOrEmpty()) {
             editHost.setText(savedHost)
         }
-        if (savedPort > 0) {
-            editPort.setText(savedPort.toString())
-        }
+        editPort.setText(savedPort.toString())
+        setupStreamingSettings()
 
         btnStartStop.setOnClickListener {
             if (service?.isStreaming?.get() == true) {
@@ -272,11 +287,23 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        service?.startStreaming(host, port)
+        val config = StreamConfig(
+            host = host,
+            port = port,
+            transport = selectedTransport,
+            opus = selectedOpusSettings()
+        )
+        val streamingService = service
+        if (streamingService == null) {
+            Toast.makeText(this, "Audio service is not ready yet", Toast.LENGTH_SHORT).show()
+            return
+        }
+        streamingService.startStreaming(config)
 
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
             .putString(KEY_HOST, host)
-            .putInt(KEY_PORT, port)
+            .putInt(portPreferenceKey(selectedTransport), port)
+            .putString(KEY_TRANSPORT, selectedTransport.name)
             .apply()
 
         updateUi()
@@ -335,14 +362,16 @@ class MainActivity : AppCompatActivity() {
             statusDot.setBackgroundResource(R.drawable.status_dot_disconnected)
             btnStartStop.text = "Start Streaming"
             btnStartStop.setIconResource(android.R.drawable.ic_media_play)
-            textStats.text = "48 kHz  \u2022  Mono  \u2022  Opus  \u2022  20ms frames"
+            textStats.text = formatStats(selectedTransport, selectedOpusSettings())
             textPackets.text = ""
             textReconnect.visibility = TextView.GONE
+            updateLockedControls(false)
             return
         }
 
         val streaming = svc.isStreaming.get()
         val state = svc.connectionState.get()
+        val activeTransport = svc.activeConfig?.transport ?: selectedTransport
 
         val stateText: String
         val dotRes: Int
@@ -375,7 +404,12 @@ class MainActivity : AppCompatActivity() {
                 btnIcon = android.R.drawable.ic_media_pause
             }
             AudioStreamService.State.STREAMING -> {
-                stateText = "Streaming"
+                stateText = if (activeTransport == TransportMode.RTP_OPUS) {
+                    val config = svc.activeConfig
+                    "Streaming RTP to ${config?.host}:${config?.port}"
+                } else {
+                    "Streaming"
+                }
                 dotRes = R.drawable.status_dot_connected
                 btnText = "Stop Streaming"
                 btnIcon = android.R.drawable.ic_media_pause
@@ -405,10 +439,11 @@ class MainActivity : AppCompatActivity() {
         btnStartStop.text = btnText
         btnStartStop.setIconResource(btnIcon)
         audioLevel.progress = svc.currentAudioLevel.get()
+        updateLockedControls(streaming)
 
         val sent = svc.packetsSent.get()
         val lost = svc.packetsLost.get()
-        textStats.text = "48 kHz  \u2022  Mono  \u2022  Opus  \u2022  20ms frames"
+        textStats.text = formatStats(activeTransport, svc.currentOpusSettings())
         textPackets.text = if (sent > 0 || lost > 0) "$sent sent  \u2022  $lost lost" else ""
 
         val reconnectAttempt = svc.reconnectAttempts.get()
@@ -417,9 +452,127 @@ class MainActivity : AppCompatActivity() {
             textReconnect.text = "Attempt $reconnectAttempt / ${AudioStreamService.MAX_RECONNECT_ATTEMPTS}"
         } else if (state == AudioStreamService.State.ERROR) {
             textReconnect.visibility = TextView.VISIBLE
-            textReconnect.text = "Check that the Linux receiver is running on the correct port"
+            textReconnect.text = if (activeTransport == TransportMode.RTP_OPUS) {
+                svc.errorMessage.get() ?: "Check the RTP destination address and network"
+            } else {
+                "Check that the Linux receiver is running on the correct port"
+            }
         } else {
             textReconnect.visibility = TextView.GONE
+        }
+    }
+
+    private fun setupStreamingSettings() {
+        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+
+        dropdownTransport.setAdapter(
+            ArrayAdapter(this, android.R.layout.simple_dropdown_item_1line, TransportMode.entries.map { it.displayName })
+        )
+        dropdownTransport.setText(selectedTransport.displayName, false)
+
+        val bandwidth = runCatching {
+            OpusBandwidthMode.valueOf(
+                prefs.getString(KEY_BANDWIDTH, OpusBandwidthMode.AUTO.name)!!
+            )
+        }.getOrDefault(OpusBandwidthMode.AUTO)
+        dropdownBandwidth.setAdapter(
+            ArrayAdapter(
+                this,
+                android.R.layout.simple_dropdown_item_1line,
+                OpusBandwidthMode.entries.map { it.displayName }
+            )
+        )
+        dropdownBandwidth.setText(bandwidth.displayName, false)
+
+        val savedBitrate = prefs.getInt(KEY_BITRATE, OpusSettings.DEFAULT_BITRATE)
+            .takeIf { it in OpusSettings.BITRATE_OPTIONS } ?: OpusSettings.DEFAULT_BITRATE
+        dropdownBitrate.setAdapter(
+            ArrayAdapter(
+                this,
+                android.R.layout.simple_dropdown_item_1line,
+                OpusSettings.BITRATE_OPTIONS.map(::formatBitrate)
+            )
+        )
+        dropdownBitrate.setText(formatBitrate(savedBitrate), false)
+
+        dropdownTransport.setOnItemClickListener { parent, _, position, _ ->
+            val newTransport = TransportMode.fromDisplayName(parent.getItemAtPosition(position).toString())
+            if (newTransport != selectedTransport) {
+                saveCurrentPort(selectedTransport)
+                selectedTransport = newTransport
+                editPort.setText(savedPortFor(newTransport).toString())
+                prefs.edit().putString(KEY_TRANSPORT, newTransport.name).apply()
+                updateLockedControls(service?.isStreaming?.get() == true)
+                updateUi()
+            }
+        }
+
+        dropdownBandwidth.setOnItemClickListener { parent, _, position, _ ->
+            val mode = OpusBandwidthMode.fromDisplayName(parent.getItemAtPosition(position).toString())
+            prefs.edit().putString(KEY_BANDWIDTH, mode.name).apply()
+            applySelectedOpusSettings()
+        }
+
+        dropdownBitrate.setOnItemClickListener { _, _, position, _ ->
+            val bitrate = OpusSettings.BITRATE_OPTIONS[position]
+            prefs.edit().putInt(KEY_BITRATE, bitrate).apply()
+            applySelectedOpusSettings()
+        }
+    }
+
+    private fun applySelectedOpusSettings() {
+        val settings = selectedOpusSettings()
+        service?.updateOpusSettings(settings)
+        textStats.text = formatStats(service?.activeConfig?.transport ?: selectedTransport, settings)
+    }
+
+    private fun selectedOpusSettings(): OpusSettings {
+        val bitrateText = dropdownBitrate.text?.toString().orEmpty()
+        val bitrate = OpusSettings.BITRATE_OPTIONS.firstOrNull {
+            formatBitrate(it) == bitrateText
+        } ?: OpusSettings.DEFAULT_BITRATE
+        val bandwidth = OpusBandwidthMode.fromDisplayName(dropdownBandwidth.text?.toString().orEmpty())
+        return OpusSettings(bitrate, bandwidth)
+    }
+
+    private fun formatBitrate(bitrate: Int): String = "${bitrate / 1_000} kbps"
+
+    private fun formatStats(transport: TransportMode, settings: OpusSettings): String {
+        val transportName = if (transport == TransportMode.RTP_OPUS) "RTP/Opus" else "ODMC/Opus"
+        return "48 kHz  •  Mono  •  $transportName  •  ${formatBitrate(settings.bitrate)}  •  ${settings.bandwidth.displayName}"
+    }
+
+    private fun updateLockedControls(streaming: Boolean) {
+        editHost.isEnabled = !streaming
+        editPort.isEnabled = !streaming
+        dropdownTransport.isEnabled = !streaming
+        val odmcIdle = !streaming && selectedTransport == TransportMode.ODMC
+        btnDiscover.isEnabled = odmcIdle
+        btnScanQr.isEnabled = odmcIdle
+    }
+
+    private fun portPreferenceKey(transport: TransportMode): String = when (transport) {
+        TransportMode.ODMC -> KEY_ODMC_PORT
+        TransportMode.RTP_OPUS -> KEY_RTP_PORT
+    }
+
+    private fun savedPortFor(transport: TransportMode): Int {
+        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        val fallback = if (transport == TransportMode.ODMC) {
+            prefs.getInt(KEY_LEGACY_PORT, transport.defaultPort)
+        } else {
+            transport.defaultPort
+        }
+        return prefs.getInt(portPreferenceKey(transport), fallback)
+            .takeIf { it in 1..65535 } ?: transport.defaultPort
+    }
+
+    private fun saveCurrentPort(transport: TransportMode) {
+        val port = editPort.text?.toString()?.toIntOrNull() ?: return
+        if (port in 1..65535) {
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putInt(portPreferenceKey(transport), port)
+                .apply()
         }
     }
 

@@ -1,11 +1,13 @@
 package com.opendroidmic
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.media.AudioFormat
 import android.media.AudioRecord
@@ -15,29 +17,30 @@ import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
-import kotlinx.coroutines.*
-import java.net.DatagramPacket
-import java.net.DatagramSocket
-import java.net.InetAddress
+import androidx.core.content.ContextCompat
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 class AudioStreamService : Service() {
     companion object {
         private const val TAG = "AudioStreamService"
         private const val CHANNEL_ID = "opendroidmic_stream"
         private const val NOTIFICATION_ID = 1
-        private const val SAMPLE_RATE = 48000
-        private const val CHANNEL_COUNT = 1
-        private const val FRAME_SIZE = 960
-        private const val BITRATE = 32000
-        private const val HELLO_ACK_TIMEOUT_MS = 3000L
-        private const val PING_INTERVAL_MS = 5000L
-        private const val PONG_TIMEOUT_MS = 5000L
         const val MAX_RECONNECT_ATTEMPTS = 10
         private const val BASE_RECONNECT_DELAY_MS = 500L
-        private const val MAX_RECONNECT_DELAY_MS = 8000L
+        private const val MAX_RECONNECT_DELAY_MS = 8_000L
     }
 
     object State {
@@ -53,6 +56,7 @@ class AudioStreamService : Service() {
     private val binder = LocalBinder()
     private var streamJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    private val desiredOpusSettings = AtomicReference(OpusSettings())
 
     val isStreaming = AtomicBoolean(false)
     val packetsSent = AtomicInteger(0)
@@ -60,10 +64,11 @@ class AudioStreamService : Service() {
     val connectionState = AtomicLong(State.DISCONNECTED)
     val currentAudioLevel = AtomicInteger(0)
     val reconnectAttempts = AtomicInteger(0)
-    val errorMessage = AtomicLong(0)
+    val errorMessage = AtomicReference<String?>(null)
 
-    private var host: String = ""
-    private var port: Int = 0
+    @Volatile
+    var activeConfig: StreamConfig? = null
+        private set
 
     inner class LocalBinder : Binder() {
         fun getService(): AudioStreamService = this@AudioStreamService
@@ -76,223 +81,191 @@ class AudioStreamService : Service() {
         createNotificationChannel()
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        return START_STICKY
-    }
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
 
-    fun startStreaming(host: String, port: Int) {
+    fun startStreaming(config: StreamConfig) {
         if (isStreaming.get()) return
 
-        this.host = host
-        this.port = port
-
-        val notification = buildNotification("Streaming to $host:$port")
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
-        }
+        activeConfig = config
+        desiredOpusSettings.set(config.opus)
+        startForegroundFor(config)
 
         isStreaming.set(true)
         packetsSent.set(0)
         packetsLost.set(0)
         reconnectAttempts.set(0)
-        errorMessage.set(0)
+        errorMessage.set(null)
         connectionState.set(State.CONNECTING)
 
         streamJob = scope.launch {
             try {
-                streamWithReconnect(host, port)
+                if (config.transport == TransportMode.ODMC) {
+                    streamWithReconnect(config)
+                } else {
+                    streamAudio(config)
+                }
             } catch (e: CancellationException) {
                 Log.d(TAG, "Stream cancelled")
             } catch (e: Exception) {
                 Log.e(TAG, "Streaming error", e)
+                errorMessage.set(e.message)
                 connectionState.set(State.ERROR)
                 isStreaming.set(false)
+            } finally {
+                currentAudioLevel.set(0)
+                if (!isStreaming.get()) {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                }
             }
         }
     }
+
+    /** Queues settings for the encoding thread; the next complete 20 ms frame applies them. */
+    fun updateOpusSettings(settings: OpusSettings) {
+        desiredOpusSettings.set(settings)
+    }
+
+    fun currentOpusSettings(): OpusSettings = desiredOpusSettings.get()
 
     fun stopStreaming() {
         isStreaming.set(false)
         streamJob?.cancel()
         streamJob = null
+        currentAudioLevel.set(0)
         connectionState.set(State.DISCONNECTED)
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
-    private suspend fun streamWithReconnect(host: String, port: Int) {
+    private suspend fun streamWithReconnect(config: StreamConfig) {
         while (isStreaming.get()) {
             try {
-                streamAudio(host, port)
+                streamAudio(config)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 Log.w(TAG, "Connection failed: ${e.message}")
+                errorMessage.set(e.message)
             }
 
             if (!isStreaming.get()) break
 
             val attempt = reconnectAttempts.incrementAndGet()
             if (attempt > MAX_RECONNECT_ATTEMPTS) {
-                Log.e(TAG, "Max reconnect attempts reached")
+                Log.e(TAG, "Maximum reconnect attempts reached")
                 connectionState.set(State.ERROR)
                 isStreaming.set(false)
                 break
             }
 
             connectionState.set(State.RECONNECTING)
-            val delay = (BASE_RECONNECT_DELAY_MS * (1L shl (attempt - 1).coerceAtMost(4)))
+            val reconnectDelay = (BASE_RECONNECT_DELAY_MS * (1L shl (attempt - 1).coerceAtMost(4)))
                 .coerceAtMost(MAX_RECONNECT_DELAY_MS)
-            Log.d(TAG, "Reconnect attempt $attempt in ${delay}ms")
-            delay(delay)
+            delay(reconnectDelay)
         }
     }
 
-    private suspend fun streamAudio(host: String, port: Int) = withContext(Dispatchers.IO) {
-        val bufferSize = AudioRecord.getMinBufferSize(
-            SAMPLE_RATE,
+    private suspend fun streamAudio(config: StreamConfig) = withContext(Dispatchers.IO) {
+        check(
+            ContextCompat.checkSelfPermission(
+                this@AudioStreamService,
+                Manifest.permission.RECORD_AUDIO
+            ) == PackageManager.PERMISSION_GRANTED
+        ) { "Microphone permission was revoked" }
+
+        val minBufferSize = AudioRecord.getMinBufferSize(
+            StreamConfig.SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT
         )
+        require(minBufferSize > 0) { "Unsupported AudioRecord configuration ($minBufferSize)" }
 
+        val recordBufferSize = maxOf(minBufferSize, StreamConfig.FRAME_SIZE * 4)
         val audioRecord = AudioRecord(
             MediaRecorder.AudioSource.MIC,
-            SAMPLE_RATE,
+            StreamConfig.SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT,
-            bufferSize
+            recordBufferSize
         )
+        check(audioRecord.state == AudioRecord.STATE_INITIALIZED) { "AudioRecord initialization failed" }
 
-        val socket = DatagramSocket()
-        socket.soTimeout = 1
-        val address = InetAddress.getByName(host)
-
-        val encoder = OpusEncoderWrapper(SAMPLE_RATE, CHANNEL_COUNT, BITRATE)
-        val sessionToken = System.currentTimeMillis()
-        val readBuffer = ShortArray(FRAME_SIZE)
+        val encoder = OpusEncoderWrapper(
+            StreamConfig.SAMPLE_RATE,
+            StreamConfig.CHANNEL_COUNT,
+            desiredOpusSettings.get()
+        )
+        val accumulator = PcmFrameAccumulator(StreamConfig.FRAME_SIZE)
+        val readBuffer = ShortArray(StreamConfig.FRAME_SIZE)
+        var transport: AudioTransport? = null
+        var recording = false
 
         try {
-            val helloPacket = Protocol.createHello(sessionToken)
-            socket.send(DatagramPacket(helloPacket, helloPacket.size, address, port))
-            Log.d(TAG, "Sent Hello to $host:$port (token: ${sessionToken.toString(16)})")
-
-            connectionState.set(State.WAITING_ACK)
-
-            var ackReceived = false
-            val ackDeadline = System.currentTimeMillis() + HELLO_ACK_TIMEOUT_MS
-            val recvBuf = ByteArray(Protocol.MAX_PACKET_SIZE)
-
-            socket.soTimeout = 500
-            while (!ackReceived && System.currentTimeMillis() < ackDeadline) {
-                try {
-                    val recvPacket = DatagramPacket(recvBuf, recvBuf.size)
-                    socket.receive(recvPacket)
-                    val parsed = Protocol.parse(recvBuf, recvPacket.length)
-                    if (parsed != null && parsed.type == Protocol.TYPE_HELLO_ACK) {
-                        ackReceived = true
-                        Log.d(TAG, "Received HelloAck")
-                    }
-                } catch (_: java.net.SocketTimeoutException) {
-                    // keep waiting
-                }
-            }
-            socket.soTimeout = 1
-
-            if (!ackReceived) {
-                Log.w(TAG, "HelloAck timeout")
-                throw java.io.IOException("HelloAck timeout")
+            transport = when (config.transport) {
+                TransportMode.ODMC -> OdmcTransport(config.host, config.port)
+                TransportMode.RTP_OPUS -> RtpOpusTransport(config.host, config.port)
             }
 
+            connectionState.set(
+                if (config.transport == TransportMode.ODMC) State.WAITING_ACK else State.CONNECTING
+            )
+            transport.start()
             audioRecord.startRecording()
-            connectionState.set(State.CONNECTED)
-
-            var sequence = 0
-            var lastPingTime = System.currentTimeMillis()
-            var lastPongTime = System.currentTimeMillis()
-            var waitingPong = false
+            recording = true
+            connectionState.set(
+                if (config.transport == TransportMode.ODMC) State.CONNECTED else State.STREAMING
+            )
+            updateNotification()
 
             while (isStreaming.get() && isActive) {
-                val read = audioRecord.read(readBuffer, 0, FRAME_SIZE)
-                if (read <= 0) continue
+                val read = audioRecord.read(readBuffer, 0, readBuffer.size)
+                if (read < 0) throw IllegalStateException("AudioRecord read failed ($read)")
+                if (read == 0) continue
 
-                var sum = 0L
-                for (i in 0 until read) {
-                    sum += Math.abs(readBuffer[i].toInt())
-                }
-                val avgLevel = (sum / read * 100 / 32768).toInt().coerceIn(0, 100)
-                currentAudioLevel.set(avgLevel)
-
-                val opusFrame = encoder.encode(readBuffer, read)
-                if (opusFrame != null) {
-                    val timestamp = sequence * 20
-                    val packet = Protocol.createAudio(sequence, timestamp, opusFrame)
-                    socket.send(DatagramPacket(packet, packet.size, address, port))
-                    packetsSent.incrementAndGet()
-                    sequence++
-                }
-
-                if (connectionState.get() == State.CONNECTED) {
-                    connectionState.set(State.STREAMING)
-                    updateNotification()
-                }
-
-                // Update notification every 2 seconds
-                if (sequence % 100 == 0 && sequence > 0) {
-                    updateNotification()
-                }
-
-                // Send periodic pings for keepalive
-                val now = System.currentTimeMillis()
-                if (now - lastPingTime >= PING_INTERVAL_MS && !waitingPong) {
-                    val pingPacket = Protocol.createPing(sequence, (sequence * 20))
-                    socket.send(DatagramPacket(pingPacket, pingPacket.size, address, port))
-                    lastPingTime = now
-                    waitingPong = true
-                    lastPongTime = now
-                }
-
-                // Check pong timeout
-                if (waitingPong && now - lastPongTime >= PONG_TIMEOUT_MS) {
-                    Log.w(TAG, "Pong timeout - connection lost")
-                    packetsLost.incrementAndGet()
-                    throw java.io.IOException("Pong timeout")
-                }
-
-                // Drain any incoming packets (pong responses) - non-blocking
-                try {
-                    val recvPacket = DatagramPacket(recvBuf, recvBuf.size)
-                    socket.receive(recvPacket)
-                    val parsed = Protocol.parse(recvBuf, recvPacket.length)
-                    if (parsed != null) {
-                        when (parsed.type) {
-                            Protocol.TYPE_PONG -> {
-                                waitingPong = false
-                                lastPongTime = now
-                            }
-                            Protocol.TYPE_STOP -> {
-                                Log.d(TAG, "Stop received from server")
-                                isStreaming.set(false)
-                                return@withContext
-                            }
+                updateAudioLevel(readBuffer, read)
+                accumulator.append(readBuffer, read) { pcmFrame ->
+                    encoder.updateSettings(desiredOpusSettings.get())
+                    val opusFrame = encoder.encode(pcmFrame, StreamConfig.FRAME_SIZE)
+                    if (opusFrame != null) {
+                        transport.sendOpusFrame(opusFrame)
+                        val sent = packetsSent.incrementAndGet()
+                        if (connectionState.get() == State.CONNECTED) {
+                            connectionState.set(State.STREAMING)
+                            updateNotification()
+                        } else if (sent % 100 == 0) {
+                            updateNotification()
                         }
                     }
-                } catch (_: java.net.SocketTimeoutException) {
-                    // no packet available
+                }
+
+                if (!transport.maintain()) {
+                    Log.d(TAG, "Remote requested stream stop")
+                    isStreaming.set(false)
+                    connectionState.set(State.DISCONNECTED)
+                    break
                 }
             }
         } finally {
-            try {
-                val stopPacket = Protocol.createStop(sessionToken)
-                socket.send(DatagramPacket(stopPacket, stopPacket.size, address, port))
-            } catch (_: Exception) {}
-
-            audioRecord.stop()
+            if (recording) {
+                try {
+                    audioRecord.stop()
+                } catch (_: IllegalStateException) {
+                    // Recorder may already have stopped during cancellation.
+                }
+            }
             audioRecord.release()
-            socket.close()
+            transport?.close()
             encoder.release()
+            accumulator.reset()
         }
+    }
+
+    private fun updateAudioLevel(samples: ShortArray, count: Int) {
+        var sum = 0L
+        for (i in 0 until count) {
+            sum += kotlin.math.abs(samples[i].toInt())
+        }
+        currentAudioLevel.set((sum / count * 100 / 32768).toInt().coerceIn(0, 100))
     }
 
     private fun createNotificationChannel() {
@@ -303,14 +276,33 @@ class AudioStreamService : Service() {
         ).apply {
             description = "OpenDroidMic audio streaming notification"
         }
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.createNotificationChannel(channel)
+        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+    }
+
+    private fun startForegroundFor(config: StreamConfig) {
+        val notification = buildNotification(notificationText(config))
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
+    }
+
+    private fun notificationText(config: StreamConfig): String = when (config.transport) {
+        TransportMode.ODMC -> "Streaming to ${config.host}:${config.port}"
+        TransportMode.RTP_OPUS -> "Streaming RTP to ${config.host}:${config.port}"
     }
 
     private fun buildNotification(text: String): Notification {
         val intent = Intent(this, MainActivity::class.java)
         val pendingIntent = PendingIntent.getActivity(
-            this, 0, intent,
+            this,
+            0,
+            intent,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
@@ -319,17 +311,14 @@ class AudioStreamService : Service() {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
         val stopPendingIntent = PendingIntent.getActivity(
-            this, 1, stopIntent,
+            this,
+            1,
+            stopIntent,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
         val sent = packetsSent.get()
-        val contentText = if (sent > 0) {
-            "$text  •  $sent packets sent"
-        } else {
-            text
-        }
-
+        val contentText = if (sent > 0) "$text  •  $sent packets sent" else text
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("OpenDroidMic")
             .setContentText(contentText)
@@ -342,13 +331,14 @@ class AudioStreamService : Service() {
     }
 
     private fun updateNotification() {
-        val notification = buildNotification("Streaming to $host:$port")
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.notify(NOTIFICATION_ID, notification)
+        val config = activeConfig ?: return
+        getSystemService(NotificationManager::class.java)
+            .notify(NOTIFICATION_ID, buildNotification(notificationText(config)))
     }
 
     override fun onDestroy() {
-        super.onDestroy()
+        isStreaming.set(false)
         scope.cancel()
+        super.onDestroy()
     }
 }

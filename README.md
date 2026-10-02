@@ -100,7 +100,8 @@ Find your PC's IP: `ip addr show | grep "inet "`
 ## Features
 
 - **Low latency** — ~20ms glass-to-glass on local Wi-Fi
-- **Opus codec** — 32kbps, 48kHz mono, excellent quality at low bitrate
+- **Adjustable Opus codec** — 16–128 kbps, Auto/Wideband/Fullband, 48 kHz mono
+- **Direct RTP/Opus mode** — stream straight into PipeWire without the Rust receiver
 - **PipeWire virtual mic** — appears as a real microphone in all Linux apps
 - **Adaptive jitter buffer** — auto-tunes 1-5 frames based on network conditions
 - **Auto-reconnect** — exponential backoff (500ms → 8s), up to 10 attempts
@@ -109,6 +110,28 @@ Find your PC's IP: `ip addr show | grep "inet "`
 - **QR code pairing** — run `./opendroidmic --qr`, scan from phone
 - **Background streaming** — foreground service, notification shows connection status
 - **Last-used memory** — remembers host/port between sessions
+
+## Direct RTP/Opus to PipeWire
+
+PipeWire 1.6.9 or newer can receive the Android stream directly. Install the
+included source configuration:
+
+```bash
+mkdir -p ~/.config/pipewire/pipewire.conf.d
+cp linux/pipewire/opendroidmic-rtp.conf \
+  ~/.config/pipewire/pipewire.conf.d/90-opendroidmic-rtp.conf
+systemctl --user restart pipewire pipewire-pulse
+```
+
+Then select **RTP / Opus (PipeWire)** in the Android app, enter the Linux PC's
+address, keep the default port `38472`, and start streaming. The source appears
+as **OpenDroidMic RTP**. RTP mode uses payload type 127, a 48 kHz clock, and one
+20 ms Opus frame per packet.
+
+The app keeps transport, host, and port fixed while streaming. Opus bitrate and
+bandwidth remain editable and take effect on the next complete 20 ms frame.
+
+RTP mode is unauthenticated and unencrypted; use it only on a trusted LAN.
 
 ## CLI Options
 
@@ -204,6 +227,12 @@ opendroidmic/
 │   │   ├── MainActivity.kt         # UI + discovery + QR
 │   │   ├── AudioStreamService.kt   # Foreground service + reconnect
 │   │   ├── OpusEncoderWrapper.kt   # Concentus Opus encoder
+│   │   ├── StreamConfig.kt          # Transport and dynamic Opus settings
+│   │   ├── AudioTransport.kt        # Transport interface
+│   │   ├── OdmcTransport.kt         # Legacy ODMC handshake + keepalive
+│   │   ├── RtpOpusTransport.kt      # Direct RTP/Opus UDP sender
+│   │   ├── RtpOpusPacketizer.kt     # RFC 3550/RFC 7587 packetizer
+│   │   ├── PcmFrameAccumulator.kt   # Exact 20 ms PCM framing
 │   │   ├── Protocol.kt             # Binary packet format
 │   │   ├── DiscoveryManager.kt     # mDNS/NSD discovery
 │   │   └── QrScanActivity.kt       # CameraX + ML Kit QR scanner
@@ -219,6 +248,7 @@ opendroidmic/
 │   │   ├── jitter.rs               # Adaptive jitter buffer
 │   │   └── test_sender.rs          # Test audio sender
 │   ├── avahi/                      # mDNS service files
+│   ├── pipewire/                   # Direct RTP/Opus source config
 │   └── Cargo.toml
 │
 ├── protocol/PROTOCOL.md            # Full protocol specification
