@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.util.Log
 import android.view.Gravity
@@ -12,7 +13,6 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
-import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
@@ -24,7 +24,10 @@ import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
 import java.util.concurrent.Executors
 
-class QrScanActivity : AppCompatActivity() {
+class QrScanActivity : EdgeToEdgeActivity() {
+    override val systemBarBackgroundColor: Int
+        get() = Color.BLACK
+
     companion object {
         private const val TAG = "QrScanActivity"
         const val EXTRA_HOST = "host"
@@ -60,7 +63,14 @@ class QrScanActivity : AppCompatActivity() {
         val overlay = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(48, 96, 48, 48)
+            val density = resources.displayMetrics.density
+            val horizontalPadding = (24 * density).toInt()
+            setPadding(horizontalPadding, (48 * density).toInt(), horizontalPadding, horizontalPadding)
+            // Keep white status icons readable even when the camera sees a bright scene.
+            background = GradientDrawable(
+                GradientDrawable.Orientation.TOP_BOTTOM,
+                intArrayOf(Color.parseColor("#CC000000"), Color.TRANSPARENT)
+            )
         }
 
         val instructionText = TextView(this).apply {
@@ -88,6 +98,8 @@ class QrScanActivity : AppCompatActivity() {
         container.addView(overlay, overlayParams)
 
         setContentView(container)
+        // The preview fills the display; only the instructions avoid bars and cutouts.
+        applySafeInsets(overlay)
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
             == PackageManager.PERMISSION_GRANTED

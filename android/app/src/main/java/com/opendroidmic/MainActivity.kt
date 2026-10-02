@@ -17,12 +17,11 @@ import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.google.android.material.button.MaterialButton
 
-class MainActivity : AppCompatActivity() {
+class MainActivity : EdgeToEdgeActivity() {
     companion object {
         private const val PERM_RECORD_AUDIO = 100
         private const val PERM_CAMERA = 101
@@ -149,6 +148,7 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+        applySafeInsets(findViewById(R.id.mainScroll), includeIme = true)
 
         handleStopIntent(intent)
 

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.OpenDroidMic.SystemBars" parent="Base.Theme.OpenDroidMic">
+        <item name="android:enforceStatusBarContrast">false</item>
+        <item name="android:enforceNavigationBarContrast">false</item>
+        <!-- AppCompat supplies a real dark theme; do not let OEM Force Dark recolor it. -->
+        <item name="android:forceDarkAllowed">false</item>
+    </style>
+</resources>
