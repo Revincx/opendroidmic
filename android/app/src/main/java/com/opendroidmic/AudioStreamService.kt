@@ -188,6 +188,14 @@ class AudioStreamService : Service() {
             .create(config.capture, recordBufferSize)
         val audioRecord = audioInput.audioRecord
         val captureEffects = CaptureEffects.create(audioRecord.audioSessionId, config.capture)
+        val denoiserCreation = if (
+            config.capture.noiseReduction == NoiseReductionMode.RNNOISE
+        ) {
+            RnnoiseDenoiser.tryCreate(assets)
+        } else {
+            RnnoiseDenoiser.CreationResult(null, null)
+        }
+        var denoiser = denoiserCreation.denoiser
         val levelProcessor = VoiceLevelProcessor(
             config.capture.mode,
             captureEffects.status.systemAgcActive
@@ -197,8 +205,11 @@ class AudioStreamService : Service() {
                 requestedMode = config.capture.mode,
                 actualAudioSource = audioInput.actualSource,
                 usingFallbackSource = audioInput.usingFallbackSource,
-                noiseSuppressionActive = captureEffects.status.noiseSuppressionActive,
-                systemAgcActive = captureEffects.status.systemAgcActive
+                noiseReduction = config.capture.noiseReduction,
+                denoiserActive = denoiser != null,
+                denoiserError = denoiserCreation.error,
+                systemAgcActive = captureEffects.status.systemAgcActive,
+                averageProcessingMicros = 0L
             )
         )
 
@@ -208,7 +219,13 @@ class AudioStreamService : Service() {
             desiredOpusSettings.get()
         )
         val accumulator = PcmFrameAccumulator(StreamConfig.FRAME_SIZE)
-        val readBuffer = ShortArray(StreamConfig.FRAME_SIZE)
+        val readBuffer = ShortArray(
+            if (config.capture.noiseReduction == NoiseReductionMode.RNNOISE) {
+                RnnoiseDenoiser.FRAME_SIZE
+            } else {
+                StreamConfig.FRAME_SIZE
+            }
+        )
         var transport: AudioTransport? = null
         var recording = false
 
@@ -229,24 +246,48 @@ class AudioStreamService : Service() {
             )
             updateNotification()
 
+            val onProcessedFrame: (ShortArray, Int, Float) -> Unit =
+                { samples, count, speechProbability ->
+                    processPcmChunk(
+                        samples,
+                        count,
+                        speechProbability,
+                        levelProcessor,
+                        accumulator,
+                        encoder,
+                        checkNotNull(transport)
+                    )
+                    val currentDenoiser = denoiser
+                    if (currentDenoiser != null && packetsSent.get() % 50 == 0) {
+                        activeCaptureStatus.updateAndGet { status ->
+                            status?.copy(
+                                averageProcessingMicros =
+                                    currentDenoiser.averageProcessingMicros()
+                            )
+                        }
+                    }
+                }
+
             while (isStreaming.get() && isActive) {
                 val read = audioRecord.read(readBuffer, 0, readBuffer.size)
                 if (read < 0) throw IllegalStateException("AudioRecord read failed ($read)")
                 if (read == 0) continue
 
-                levelProcessor.process(readBuffer, read)
-                updateAudioLevel(readBuffer, read)
-                accumulator.append(readBuffer, read) { pcmFrame ->
-                    encoder.updateSettings(desiredOpusSettings.get())
-                    val opusFrame = encoder.encode(pcmFrame, StreamConfig.FRAME_SIZE)
-                    if (opusFrame != null) {
-                        transport.sendOpusFrame(opusFrame)
-                        val sent = packetsSent.incrementAndGet()
-                        if (connectionState.get() == State.CONNECTED) {
-                            connectionState.set(State.STREAMING)
-                            updateNotification()
-                        } else if (sent % 100 == 0) {
-                            updateNotification()
+                val activeDenoiser = denoiser
+                if (activeDenoiser == null) {
+                    onProcessedFrame(readBuffer, read, 1.0f)
+                } else {
+                    try {
+                        activeDenoiser.process(readBuffer, read, onProcessedFrame)
+                    } catch (e: RnnoiseProcessingException) {
+                        Log.e(TAG, "RNNoise processing failed; continuing without denoising", e)
+                        activeDenoiser.close()
+                        denoiser = null
+                        activeCaptureStatus.updateAndGet { status ->
+                            status?.copy(
+                                denoiserActive = false,
+                                denoiserError = e.message ?: "RNNoise processing failed"
+                            )
                         }
                     }
                 }
@@ -266,12 +307,40 @@ class AudioStreamService : Service() {
                     // Recorder may already have stopped during cancellation.
                 }
             }
+            denoiser?.close()
             captureEffects.release()
             audioRecord.release()
             activeCaptureStatus.set(null)
             transport?.close()
             encoder.release()
             accumulator.reset()
+        }
+    }
+
+    private fun processPcmChunk(
+        samples: ShortArray,
+        count: Int,
+        speechProbability: Float,
+        levelProcessor: VoiceLevelProcessor,
+        accumulator: PcmFrameAccumulator,
+        encoder: OpusEncoderWrapper,
+        transport: AudioTransport
+    ) {
+        levelProcessor.process(samples, count, speechProbability)
+        updateAudioLevel(samples, count)
+        accumulator.append(samples, count) { pcmFrame ->
+            encoder.updateSettings(desiredOpusSettings.get())
+            val opusFrame = encoder.encode(pcmFrame, StreamConfig.FRAME_SIZE)
+            if (opusFrame != null) {
+                transport.sendOpusFrame(opusFrame)
+                val sent = packetsSent.incrementAndGet()
+                if (connectionState.get() == State.CONNECTED) {
+                    connectionState.set(State.STREAMING)
+                    updateNotification()
+                } else if (sent % 100 == 0) {
+                    updateNotification()
+                }
+            }
         }
     }
 

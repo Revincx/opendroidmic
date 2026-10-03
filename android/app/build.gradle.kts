@@ -6,14 +6,24 @@ plugins {
 android {
     namespace = "com.opendroidmic"
     compileSdk = 35
+    ndkVersion = "27.0.12077973"
 
     defaultConfig {
         applicationId = "com.opendroidmic"
         minSdk = 26
         targetSdk = 35
         versionCode = 2
-        versionName = "0.2.2"
+        versionName = "0.2.3"
         resValue("string", "app_version", "v${versionName}")
+
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+        }
+        externalNativeBuild {
+            cmake {
+                arguments += "-DANDROID_STL=c++_static"
+            }
+        }
     }
 
     signingConfigs {
@@ -53,6 +63,13 @@ android {
 
     testOptions {
         unitTests.isReturnDefaultValues = true
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
     }
 
     splits {

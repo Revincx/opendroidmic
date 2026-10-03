@@ -6,7 +6,6 @@ import android.content.ComponentName
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
-import android.media.audiofx.NoiseSuppressor
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -587,13 +586,9 @@ class MainActivity : EdgeToEdgeActivity() {
             PickupMode.CALL -> "For close speech and voice calls."
             PickupMode.NATIVE -> "Minimal processing. Preserves the original input level."
         }
-        val noiseAvailable = NoiseSuppressor.isAvailable()
-        textPickupDescription.text = if (noiseAvailable) {
-            description
-        } else {
-            "$description\nSystem noise reduction is not supported on this device."
-        }
-        switchNoiseReduction.isChecked = noiseAvailable && savedNoiseReduction(selectedPickupMode)
+        textPickupDescription.text =
+            "$description\nWhen enabled, RNNoise adds about 10 ms of processing latency."
+        switchNoiseReduction.isChecked = savedNoiseReduction(selectedPickupMode)
         updatingCaptureControls = false
         updateLockedControls(service?.isStreaming?.get() == true)
     }
@@ -623,7 +618,11 @@ class MainActivity : EdgeToEdgeActivity() {
 
     private fun selectedCaptureSettings(): CaptureSettings = CaptureSettings(
         mode = selectedPickupMode,
-        noiseSuppression = switchNoiseReduction.isChecked && NoiseSuppressor.isAvailable()
+        noiseReduction = if (switchNoiseReduction.isChecked) {
+            NoiseReductionMode.RNNOISE
+        } else {
+            NoiseReductionMode.OFF
+        }
     )
 
     private fun formatStats(
@@ -634,8 +633,13 @@ class MainActivity : EdgeToEdgeActivity() {
     ): String {
         val transportName = if (transport == TransportMode.RTP_OPUS) "RTP/Opus" else "ODMC/Opus"
         val fallback = if (status?.usingFallbackSource == true) " (compatibility fallback)" else ""
-        val noiseActive = status?.noiseSuppressionActive ?: capture.noiseSuppression
-        val noiseText = if (noiseActive) "Noise reduction on" else "Noise reduction off"
+        val noiseText = when {
+            status?.denoiserError != null -> "RNNoise unavailable"
+            status?.denoiserActive == true -> "RNNoise on"
+            status != null -> "RNNoise off"
+            capture.noiseReduction == NoiseReductionMode.RNNOISE -> "RNNoise on"
+            else -> "RNNoise off"
+        }
         return "${capture.mode.displayName}$fallback  •  $noiseText\n" +
             "48 kHz  •  Mono  •  $transportName  •  ${formatBitrate(settings.bitrate)}  •  ${settings.bandwidth.displayName}"
     }
@@ -647,7 +651,7 @@ class MainActivity : EdgeToEdgeActivity() {
         for (index in 0 until pickupModeToggle.childCount) {
             pickupModeToggle.getChildAt(index).isEnabled = !streaming
         }
-        switchNoiseReduction.isEnabled = !streaming && NoiseSuppressor.isAvailable()
+        switchNoiseReduction.isEnabled = !streaming
         val odmcIdle = !streaming && selectedTransport == TransportMode.ODMC
         btnDiscover.isEnabled = odmcIdle
         btnScanQr.isEnabled = odmcIdle

@@ -99,8 +99,10 @@ Find your PC's IP: `ip addr show | grep "inet "`
 
 ## Features
 
-- **Low latency** — ~20ms glass-to-glass on local Wi-Fi
+- **Low latency** — ~20ms base path on local Wi-Fi; RNNoise adds about 10ms
 - **Adjustable Opus codec** — 16–128 kbps, Auto/Wideband/Fullband, 48 kHz mono
+- **Pickup profiles** — Desktop, Call, and Native capture tuning
+- **RNNoise suppression** — optional on-device neural background-noise removal
 - **Direct RTP/Opus mode** — stream straight into PipeWire without the Rust receiver
 - **PipeWire virtual mic** — appears as a real microphone in all Linux apps
 - **Adaptive jitter buffer** — auto-tunes 1-5 frames based on network conditions
@@ -169,7 +171,7 @@ sudo systemctl restart avahi-daemon
 |-----------|---------------------------|-------------------|
 | Linux runtime | PipeWire 1.0+, libopus | Same |
 | Linux build | None | Rust 1.75+, libpipewire-dev, libopus-dev |
-| Android | Android 8.0+ (API 26) | + Android SDK + JDK 17 |
+| Android | Android 8.0+ (API 26) | + Android SDK 35, NDK 27.0.12077973, CMake 3.22.1, JDK 17 |
 
 ## Test Without Phone
 

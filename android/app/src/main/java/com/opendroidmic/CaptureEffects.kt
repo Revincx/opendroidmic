@@ -6,7 +6,7 @@ import android.media.audiofx.NoiseSuppressor
 import android.util.Log
 
 data class CaptureEffectStatus(
-    val noiseSuppressionActive: Boolean,
+    val platformNoiseSuppressionActive: Boolean,
     val systemAgcActive: Boolean
 )
 
@@ -14,8 +14,11 @@ data class ActiveCaptureStatus(
     val requestedMode: PickupMode,
     val actualAudioSource: Int,
     val usingFallbackSource: Boolean,
-    val noiseSuppressionActive: Boolean,
-    val systemAgcActive: Boolean
+    val noiseReduction: NoiseReductionMode,
+    val denoiserActive: Boolean,
+    val denoiserError: String?,
+    val systemAgcActive: Boolean,
+    val averageProcessingMicros: Long = 0L
 )
 
 class CaptureEffects private constructor(
@@ -28,10 +31,9 @@ class CaptureEffects private constructor(
         private const val TAG = "CaptureEffects"
 
         fun create(audioSessionId: Int, settings: CaptureSettings): CaptureEffects {
-            val noiseSuppressor = createNoiseSuppressor(
-                audioSessionId,
-                settings.noiseSuppression
-            )
+            // RNNoise is the only user-facing denoiser. Disable the platform
+            // effect when it is controllable to avoid processing speech twice.
+            val noiseSuppressor = createNoiseSuppressor(audioSessionId, false)
 
             // Call mode prefers the device's voice AGC. Desktop mode uses the app's
             // wider-range leveler, while Native mode deliberately stays unmodified.
@@ -43,12 +45,12 @@ class CaptureEffects private constructor(
             // Playback happens on the Linux host, so Android has no echo reference.
             val acousticEchoCanceler = createAcousticEchoCanceler(audioSessionId, false)
             val status = CaptureEffectStatus(
-                noiseSuppressionActive = noiseSuppressor.safeEnabled(),
+                platformNoiseSuppressionActive = noiseSuppressor.safeEnabled(),
                 systemAgcActive = automaticGainControl.safeEnabled()
             )
             Log.i(
                 TAG,
-                "mode=${settings.mode} noise=${status.noiseSuppressionActive} " +
+                "mode=${settings.mode} platformNoise=${status.platformNoiseSuppressionActive} " +
                     "systemAgc=${status.systemAgcActive}"
             )
             return CaptureEffects(

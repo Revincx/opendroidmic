@@ -37,8 +37,13 @@ enum class PickupMode(val displayName: String) {
 
 data class CaptureSettings(
     val mode: PickupMode = PickupMode.DESKTOP,
-    val noiseSuppression: Boolean = true
+    val noiseReduction: NoiseReductionMode = NoiseReductionMode.RNNOISE
 )
+
+enum class NoiseReductionMode {
+    OFF,
+    RNNOISE
+}
 
 data class OpusSettings(
     val bitrate: Int = DEFAULT_BITRATE,

@@ -36,7 +36,7 @@ class VoiceLevelProcessor(
         }
     }
 
-    fun process(samples: ShortArray, count: Int) {
+    fun process(samples: ShortArray, count: Int, speechProbability: Float = 1.0f) {
         require(count in 0..samples.size) { "Invalid sample count: $count" }
         if (!enabled || count == 0) return
 
@@ -50,7 +50,9 @@ class VoiceLevelProcessor(
 
         val rms = sqrt(sumSquares / count)
         val rmsDbfs = if (rms > 0.0) 20.0 * log10(rms / PCM_FULL_SCALE) else SILENCE_DBFS
-        val desiredGain = if (rmsDbfs >= NOISE_FLOOR_DBFS) {
+        val desiredGain = if (
+            rmsDbfs >= NOISE_FLOOR_DBFS && speechProbability >= MIN_SPEECH_PROBABILITY
+        ) {
             dbToLinear(targetDbfs - rmsDbfs).coerceIn(1.0, maxGain)
         } else {
             1.0
@@ -79,6 +81,7 @@ class VoiceLevelProcessor(
         private const val LIMITER_PEAK = 32700.0
         private const val NOISE_FLOOR_DBFS = -50.0
         private const val SILENCE_DBFS = -120.0
+        private const val MIN_SPEECH_PROBABILITY = 0.5f
         private const val GAIN_RISE_MS = 800.0
         private const val GAIN_REDUCTION_MS = 80.0
     }

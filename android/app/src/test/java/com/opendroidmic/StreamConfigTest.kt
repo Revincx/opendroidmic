@@ -27,7 +27,7 @@ class StreamConfigTest {
         val capture = CaptureSettings()
 
         assertEquals(PickupMode.DESKTOP, capture.mode)
-        assertEquals(true, capture.noiseSuppression)
+        assertEquals(NoiseReductionMode.RNNOISE, capture.noiseReduction)
     }
 
     @Test

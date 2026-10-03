@@ -219,7 +219,7 @@
                     android:layout_height="wrap_content"
                     android:layout_marginTop="10dp"
                     android:checked="true"
-                    android:text="Reduce background noise"
+                    android:text="Noise reduction"
                     android:textColor="?attr/colorOnSurface"
                     android:textSize="13sp" />
             </LinearLayout>
