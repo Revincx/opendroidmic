@@ -11,7 +11,6 @@ import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.media.AudioFormat
 import android.media.AudioRecord
-import android.media.MediaRecorder
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
@@ -65,6 +64,7 @@ class AudioStreamService : Service() {
     val currentAudioLevel = AtomicInteger(0)
     val reconnectAttempts = AtomicInteger(0)
     val errorMessage = AtomicReference<String?>(null)
+    val activeCaptureStatus = AtomicReference<ActiveCaptureStatus?>(null)
 
     @Volatile
     var activeConfig: StreamConfig? = null
@@ -95,6 +95,7 @@ class AudioStreamService : Service() {
         packetsLost.set(0)
         reconnectAttempts.set(0)
         errorMessage.set(null)
+        activeCaptureStatus.set(null)
         connectionState.set(State.CONNECTING)
 
         streamJob = scope.launch {
@@ -113,6 +114,7 @@ class AudioStreamService : Service() {
                 isStreaming.set(false)
             } finally {
                 currentAudioLevel.set(0)
+                activeCaptureStatus.set(null)
                 if (!isStreaming.get()) {
                     stopForeground(STOP_FOREGROUND_REMOVE)
                 }
@@ -132,6 +134,7 @@ class AudioStreamService : Service() {
         streamJob?.cancel()
         streamJob = null
         currentAudioLevel.set(0)
+        activeCaptureStatus.set(null)
         connectionState.set(State.DISCONNECTED)
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -181,14 +184,23 @@ class AudioStreamService : Service() {
         require(minBufferSize > 0) { "Unsupported AudioRecord configuration ($minBufferSize)" }
 
         val recordBufferSize = maxOf(minBufferSize, StreamConfig.FRAME_SIZE * 4)
-        val audioRecord = AudioRecord(
-            MediaRecorder.AudioSource.MIC,
-            StreamConfig.SAMPLE_RATE,
-            AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT,
-            recordBufferSize
+        val audioInput = AudioInputFactory(this@AudioStreamService)
+            .create(config.capture, recordBufferSize)
+        val audioRecord = audioInput.audioRecord
+        val captureEffects = CaptureEffects.create(audioRecord.audioSessionId, config.capture)
+        val levelProcessor = VoiceLevelProcessor(
+            config.capture.mode,
+            captureEffects.status.systemAgcActive
         )
-        check(audioRecord.state == AudioRecord.STATE_INITIALIZED) { "AudioRecord initialization failed" }
+        activeCaptureStatus.set(
+            ActiveCaptureStatus(
+                requestedMode = config.capture.mode,
+                actualAudioSource = audioInput.actualSource,
+                usingFallbackSource = audioInput.usingFallbackSource,
+                noiseSuppressionActive = captureEffects.status.noiseSuppressionActive,
+                systemAgcActive = captureEffects.status.systemAgcActive
+            )
+        )
 
         val encoder = OpusEncoderWrapper(
             StreamConfig.SAMPLE_RATE,
@@ -222,6 +234,7 @@ class AudioStreamService : Service() {
                 if (read < 0) throw IllegalStateException("AudioRecord read failed ($read)")
                 if (read == 0) continue
 
+                levelProcessor.process(readBuffer, read)
                 updateAudioLevel(readBuffer, read)
                 accumulator.append(readBuffer, read) { pcmFrame ->
                     encoder.updateSettings(desiredOpusSettings.get())
@@ -253,7 +266,9 @@ class AudioStreamService : Service() {
                     // Recorder may already have stopped during cancellation.
                 }
             }
+            captureEffects.release()
             audioRecord.release()
+            activeCaptureStatus.set(null)
             transport?.close()
             encoder.release()
             accumulator.reset()
@@ -261,11 +276,14 @@ class AudioStreamService : Service() {
     }
 
     private fun updateAudioLevel(samples: ShortArray, count: Int) {
-        var sum = 0L
+        var sumSquares = 0.0
         for (i in 0 until count) {
-            sum += kotlin.math.abs(samples[i].toInt())
+            val value = samples[i].toDouble()
+            sumSquares += value * value
         }
-        currentAudioLevel.set((sum / count * 100 / 32768).toInt().coerceIn(0, 100))
+        val rms = kotlin.math.sqrt(sumSquares / count)
+        val dbfs = if (rms > 0.0) 20.0 * kotlin.math.log10(rms / 32768.0) else -60.0
+        currentAudioLevel.set((((dbfs + 60.0) / 60.0) * 100.0).toInt().coerceIn(0, 100))
     }
 
     private fun createNotificationChannel() {
@@ -293,8 +311,10 @@ class AudioStreamService : Service() {
     }
 
     private fun notificationText(config: StreamConfig): String = when (config.transport) {
-        TransportMode.ODMC -> "Streaming to ${config.host}:${config.port}"
-        TransportMode.RTP_OPUS -> "Streaming RTP to ${config.host}:${config.port}"
+        TransportMode.ODMC ->
+            "${config.capture.mode.displayName} · Streaming to ${config.host}:${config.port}"
+        TransportMode.RTP_OPUS ->
+            "${config.capture.mode.displayName} · Streaming RTP to ${config.host}:${config.port}"
     }
 
     private fun buildNotification(text: String): Notification {

@@ -21,4 +21,19 @@ class StreamConfigTest {
         assertEquals(38_471, TransportMode.ODMC.defaultPort)
         assertEquals(38_472, TransportMode.RTP_OPUS.defaultPort)
     }
+
+    @Test
+    fun `capture defaults are desktop with noise reduction`() {
+        val capture = CaptureSettings()
+
+        assertEquals(PickupMode.DESKTOP, capture.mode)
+        assertEquals(true, capture.noiseSuppression)
+    }
+
+    @Test
+    fun `pickup display names round trip`() {
+        PickupMode.entries.forEach { mode ->
+            assertEquals(mode, PickupMode.fromDisplayName(mode.displayName))
+        }
+    }
 }

@@ -6,6 +6,7 @@ import android.content.ComponentName
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
+import android.media.audiofx.NoiseSuppressor
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -20,6 +21,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.google.android.material.button.MaterialButton
+import com.google.android.material.button.MaterialButtonToggleGroup
+import com.google.android.material.materialswitch.MaterialSwitch
 
 class MainActivity : EdgeToEdgeActivity() {
     companion object {
@@ -35,6 +38,10 @@ class MainActivity : EdgeToEdgeActivity() {
         private const val KEY_TRANSPORT = "transport"
         private const val KEY_BITRATE = "opus_bitrate"
         private const val KEY_BANDWIDTH = "opus_bandwidth"
+        private const val KEY_PICKUP_MODE = "pickup_mode"
+        private const val KEY_NOISE_DESKTOP = "noise_desktop"
+        private const val KEY_NOISE_CALL = "noise_call"
+        private const val KEY_NOISE_NATIVE = "noise_native"
     }
 
     private lateinit var editHost: com.google.android.material.textfield.TextInputEditText
@@ -52,6 +59,9 @@ class MainActivity : EdgeToEdgeActivity() {
     private lateinit var dropdownTransport: com.google.android.material.textfield.MaterialAutoCompleteTextView
     private lateinit var dropdownBandwidth: com.google.android.material.textfield.MaterialAutoCompleteTextView
     private lateinit var dropdownBitrate: com.google.android.material.textfield.MaterialAutoCompleteTextView
+    private lateinit var pickupModeToggle: MaterialButtonToggleGroup
+    private lateinit var textPickupDescription: TextView
+    private lateinit var switchNoiseReduction: MaterialSwitch
 
     private var service: AudioStreamService? = null
     private var bound = false
@@ -60,6 +70,8 @@ class MainActivity : EdgeToEdgeActivity() {
     private var discovering = false
     private var pendingAction: (() -> Unit)? = null
     private var selectedTransport = TransportMode.ODMC
+    private var selectedPickupMode = PickupMode.DESKTOP
+    private var updatingCaptureControls = false
 
     private val qrScanLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -167,6 +179,9 @@ class MainActivity : EdgeToEdgeActivity() {
         dropdownTransport = findViewById(R.id.dropdownTransport)
         dropdownBandwidth = findViewById(R.id.dropdownBandwidth)
         dropdownBitrate = findViewById(R.id.dropdownBitrate)
+        pickupModeToggle = findViewById(R.id.pickupModeToggle)
+        textPickupDescription = findViewById(R.id.textPickupDescription)
+        switchNoiseReduction = findViewById(R.id.switchNoiseReduction)
 
         discoveryManager = DiscoveryManager(this)
 
@@ -175,11 +190,13 @@ class MainActivity : EdgeToEdgeActivity() {
         selectedTransport = runCatching {
             TransportMode.valueOf(prefs.getString(KEY_TRANSPORT, TransportMode.ODMC.name)!!)
         }.getOrDefault(TransportMode.ODMC)
+        selectedPickupMode = loadPickupMode(prefs)
         val savedPort = savedPortFor(selectedTransport)
         if (!savedHost.isNullOrEmpty()) {
             editHost.setText(savedHost)
         }
         editPort.setText(savedPort.toString())
+        setupCaptureSettings()
         setupStreamingSettings()
 
         btnStartStop.setOnClickListener {
@@ -291,7 +308,8 @@ class MainActivity : EdgeToEdgeActivity() {
             host = host,
             port = port,
             transport = selectedTransport,
-            opus = selectedOpusSettings()
+            opus = selectedOpusSettings(),
+            capture = selectedCaptureSettings()
         )
         val streamingService = service
         if (streamingService == null) {
@@ -362,7 +380,11 @@ class MainActivity : EdgeToEdgeActivity() {
             statusDot.setBackgroundResource(R.drawable.status_dot_disconnected)
             btnStartStop.text = "Start Streaming"
             btnStartStop.setIconResource(android.R.drawable.ic_media_play)
-            textStats.text = formatStats(selectedTransport, selectedOpusSettings())
+            textStats.text = formatStats(
+                selectedTransport,
+                selectedOpusSettings(),
+                selectedCaptureSettings()
+            )
             textPackets.text = ""
             textReconnect.visibility = TextView.GONE
             updateLockedControls(false)
@@ -371,7 +393,9 @@ class MainActivity : EdgeToEdgeActivity() {
 
         val streaming = svc.isStreaming.get()
         val state = svc.connectionState.get()
-        val activeTransport = svc.activeConfig?.transport ?: selectedTransport
+        val activeConfig = svc.activeConfig
+        val activeTransport = activeConfig?.transport ?: selectedTransport
+        val activeCapture = activeConfig?.capture ?: selectedCaptureSettings()
 
         val stateText: String
         val dotRes: Int
@@ -443,7 +467,12 @@ class MainActivity : EdgeToEdgeActivity() {
 
         val sent = svc.packetsSent.get()
         val lost = svc.packetsLost.get()
-        textStats.text = formatStats(activeTransport, svc.currentOpusSettings())
+        textStats.text = formatStats(
+            activeTransport,
+            svc.currentOpusSettings(),
+            activeCapture,
+            svc.activeCaptureStatus.get()
+        )
         textPackets.text = if (sent > 0 || lost > 0) "$sent sent  \u2022  $lost lost" else ""
 
         val reconnectAttempt = svc.reconnectAttempts.get()
@@ -520,10 +549,65 @@ class MainActivity : EdgeToEdgeActivity() {
         }
     }
 
+    private fun setupCaptureSettings() {
+        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        refreshCaptureControls()
+
+        pickupModeToggle.addOnButtonCheckedListener { _, checkedId, isChecked ->
+            if (!isChecked || updatingCaptureControls) return@addOnButtonCheckedListener
+            selectedPickupMode = when (checkedId) {
+                R.id.btnPickupCall -> PickupMode.CALL
+                R.id.btnPickupNative -> PickupMode.NATIVE
+                else -> PickupMode.DESKTOP
+            }
+            prefs.edit().putString(KEY_PICKUP_MODE, selectedPickupMode.name).apply()
+            refreshCaptureControls()
+            updateUi()
+        }
+
+        switchNoiseReduction.setOnCheckedChangeListener { _, checked ->
+            if (updatingCaptureControls) return@setOnCheckedChangeListener
+            prefs.edit().putBoolean(noisePreferenceKey(selectedPickupMode), checked).apply()
+            updateUi()
+        }
+    }
+
+    private fun refreshCaptureControls() {
+        updatingCaptureControls = true
+        pickupModeToggle.check(
+            when (selectedPickupMode) {
+                PickupMode.DESKTOP -> R.id.btnPickupDesktop
+                PickupMode.CALL -> R.id.btnPickupCall
+                PickupMode.NATIVE -> R.id.btnPickupNative
+            }
+        )
+
+        val description = when (selectedPickupMode) {
+            PickupMode.DESKTOP -> "For speech from 0.3–1 m away. Raises quiet voices."
+            PickupMode.CALL -> "For close speech and voice calls."
+            PickupMode.NATIVE -> "Minimal processing. Preserves the original input level."
+        }
+        val noiseAvailable = NoiseSuppressor.isAvailable()
+        textPickupDescription.text = if (noiseAvailable) {
+            description
+        } else {
+            "$description\nSystem noise reduction is not supported on this device."
+        }
+        switchNoiseReduction.isChecked = noiseAvailable && savedNoiseReduction(selectedPickupMode)
+        updatingCaptureControls = false
+        updateLockedControls(service?.isStreaming?.get() == true)
+    }
+
     private fun applySelectedOpusSettings() {
         val settings = selectedOpusSettings()
         service?.updateOpusSettings(settings)
-        textStats.text = formatStats(service?.activeConfig?.transport ?: selectedTransport, settings)
+        val activeConfig = service?.activeConfig
+        textStats.text = formatStats(
+            activeConfig?.transport ?: selectedTransport,
+            settings,
+            activeConfig?.capture ?: selectedCaptureSettings(),
+            service?.activeCaptureStatus?.get()
+        )
     }
 
     private fun selectedOpusSettings(): OpusSettings {
@@ -537,15 +621,33 @@ class MainActivity : EdgeToEdgeActivity() {
 
     private fun formatBitrate(bitrate: Int): String = "${bitrate / 1_000} kbps"
 
-    private fun formatStats(transport: TransportMode, settings: OpusSettings): String {
+    private fun selectedCaptureSettings(): CaptureSettings = CaptureSettings(
+        mode = selectedPickupMode,
+        noiseSuppression = switchNoiseReduction.isChecked && NoiseSuppressor.isAvailable()
+    )
+
+    private fun formatStats(
+        transport: TransportMode,
+        settings: OpusSettings,
+        capture: CaptureSettings,
+        status: ActiveCaptureStatus? = null
+    ): String {
         val transportName = if (transport == TransportMode.RTP_OPUS) "RTP/Opus" else "ODMC/Opus"
-        return "48 kHz  •  Mono  •  $transportName  •  ${formatBitrate(settings.bitrate)}  •  ${settings.bandwidth.displayName}"
+        val fallback = if (status?.usingFallbackSource == true) " (compatibility fallback)" else ""
+        val noiseActive = status?.noiseSuppressionActive ?: capture.noiseSuppression
+        val noiseText = if (noiseActive) "Noise reduction on" else "Noise reduction off"
+        return "${capture.mode.displayName}$fallback  •  $noiseText\n" +
+            "48 kHz  •  Mono  •  $transportName  •  ${formatBitrate(settings.bitrate)}  •  ${settings.bandwidth.displayName}"
     }
 
     private fun updateLockedControls(streaming: Boolean) {
         editHost.isEnabled = !streaming
         editPort.isEnabled = !streaming
         dropdownTransport.isEnabled = !streaming
+        for (index in 0 until pickupModeToggle.childCount) {
+            pickupModeToggle.getChildAt(index).isEnabled = !streaming
+        }
+        switchNoiseReduction.isEnabled = !streaming && NoiseSuppressor.isAvailable()
         val odmcIdle = !streaming && selectedTransport == TransportMode.ODMC
         btnDiscover.isEnabled = odmcIdle
         btnScanQr.isEnabled = odmcIdle
@@ -574,6 +676,37 @@ class MainActivity : EdgeToEdgeActivity() {
                 .putInt(portPreferenceKey(transport), port)
                 .apply()
         }
+    }
+
+    private fun loadPickupMode(prefs: android.content.SharedPreferences): PickupMode {
+        prefs.getString(KEY_PICKUP_MODE, null)?.let { saved ->
+            return runCatching { PickupMode.valueOf(saved) }.getOrDefault(PickupMode.DESKTOP)
+        }
+
+        val hasLegacySettings = listOf(
+            KEY_HOST,
+            KEY_LEGACY_PORT,
+            KEY_ODMC_PORT,
+            KEY_RTP_PORT,
+            KEY_TRANSPORT,
+            KEY_BITRATE,
+            KEY_BANDWIDTH
+        ).any(prefs::contains)
+        val migratedMode = if (hasLegacySettings) PickupMode.NATIVE else PickupMode.DESKTOP
+        prefs.edit().putString(KEY_PICKUP_MODE, migratedMode.name).apply()
+        return migratedMode
+    }
+
+    private fun noisePreferenceKey(mode: PickupMode): String = when (mode) {
+        PickupMode.DESKTOP -> KEY_NOISE_DESKTOP
+        PickupMode.CALL -> KEY_NOISE_CALL
+        PickupMode.NATIVE -> KEY_NOISE_NATIVE
+    }
+
+    private fun savedNoiseReduction(mode: PickupMode): Boolean {
+        val defaultValue = mode != PickupMode.NATIVE
+        return getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+            .getBoolean(noisePreferenceKey(mode), defaultValue)
     }
 
     override fun onDestroy() {

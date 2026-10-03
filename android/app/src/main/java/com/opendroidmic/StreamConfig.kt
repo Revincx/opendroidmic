@@ -24,6 +24,22 @@ enum class OpusBandwidthMode(val displayName: String) {
     }
 }
 
+enum class PickupMode(val displayName: String) {
+    DESKTOP("Desktop"),
+    CALL("Call"),
+    NATIVE("Native");
+
+    companion object {
+        fun fromDisplayName(value: String): PickupMode =
+            entries.firstOrNull { it.displayName == value } ?: DESKTOP
+    }
+}
+
+data class CaptureSettings(
+    val mode: PickupMode = PickupMode.DESKTOP,
+    val noiseSuppression: Boolean = true
+)
+
 data class OpusSettings(
     val bitrate: Int = DEFAULT_BITRATE,
     val bandwidth: OpusBandwidthMode = OpusBandwidthMode.AUTO
@@ -42,7 +58,8 @@ data class StreamConfig(
     val host: String,
     val port: Int,
     val transport: TransportMode = TransportMode.ODMC,
-    val opus: OpusSettings = OpusSettings()
+    val opus: OpusSettings = OpusSettings(),
+    val capture: CaptureSettings = CaptureSettings()
 ) {
     init {
         require(host.isNotBlank()) { "Host must not be blank" }
