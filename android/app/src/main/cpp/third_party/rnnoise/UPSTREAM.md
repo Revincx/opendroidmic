@@ -12,3 +12,6 @@
 
 The vendored `denoise.c` initializes `RNNModel.file` for buffer-backed models.
 This local safety fix prevents reading an uninitialized field during cleanup.
+The small `src/rnnoise_model.c` contains the generated model topology from
+`rnnoise_data_little.c`; the large generated C weight arrays are replaced by
+the bundled runtime weights blob.

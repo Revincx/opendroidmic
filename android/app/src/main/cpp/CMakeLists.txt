@@ -12,6 +12,7 @@ add_library(rnnoise STATIC
     "${RNNOISE_DIR}/src/nnet.c"
     "${RNNOISE_DIR}/src/nnet_default.c"
     "${RNNOISE_DIR}/src/parse_lpcnet_weights.c"
+    "${RNNOISE_DIR}/src/rnnoise_model.c"
     "${RNNOISE_DIR}/src/rnnoise_tables.c"
 )
 

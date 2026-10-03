@@ -55,6 +55,8 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
         with:
+          # Keep SDK metadata compatible with the AGP 8.7 toolchain.
+          cmdline-tools-version: '12266719'
           # Override the default package list, which includes the retired "tools" package.
           packages: 'platform-tools platforms;android-35 build-tools;34.0.0 cmake;3.22.1 ndk;27.0.12077973'
 
